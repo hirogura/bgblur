@@ -25,7 +25,7 @@ def _env_float(name: str, default: float) -> float:
 
 @dataclass
 class Settings:
-    host: str = os.environ.get("BGBLUR_HOST", "127.0.0.1")
+    host: str = os.environ.get("BGBLUR_HOST", "0.0.0.0")
     port: int = _env_int("BGBLUR_PORT", 3371)
     max_upload_bytes: int = _env_int("BGBLUR_MAX_UPLOAD", 40 * 1024 * 1024)
     # 背景セグメンテーションに使う rembg のモデル名.

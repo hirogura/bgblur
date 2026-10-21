@@ -8,7 +8,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${BGBLUR_PORT:-3371}"
-HOST="${BGBLUR_HOST:-127.0.0.1}"
+HOST="${BGBLUR_HOST:-0.0.0.0}"
 VENV="$ROOT/.venv"
 SERVICE_FILE="/etc/systemd/system/bgblur.service"
 MODEL_DIR="$ROOT/models"
