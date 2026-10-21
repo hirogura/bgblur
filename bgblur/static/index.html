@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="admin-token" content="__ADMIN_TOKEN__">
+<title>bgblur __VERSION__</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛍️</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">🛍️</span>
+    <h1>bgblur</h1>
+    <span class="version" id="version">__VERSION__</span>
+  </div>
+  <div class="top-actions">
+    <button type="button" class="btn" id="btn-update" title="GitHub から最新版に更新します">
+      <span class="ico" aria-hidden="true">⟳</span> アップデート
+    </button>
+    <button type="button" class="btn" id="btn-restart" title="bgblur サービスを再起動します">
+      <span class="ico" aria-hidden="true">⏻</span> 再起動
+    </button>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="panel side">
+    <div class="block">
+      <div class="block-head">
+        <h2 class="block-title">写真</h2>
+        <button type="button" class="btn btn-sm" id="btn-clear-cache"
+                title="サーバーに残ったキャッシュ画像を削除します">全てクリア</button>
+      </div>
+      <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="写真を追加">
+        <p class="dz-main">写真をドラッグ＆ドロップ</p>
+        <p class="dz-sub">またはここをクリックして選択</p>
+      </div>
+      <input type="file" id="file-input" accept="image/*" multiple hidden>
+      <div class="thumbs" id="thumbs"></div>
+    </div>
+
+    <div class="block">
+      <h2 class="block-title">ぼかし</h2>
+      <label class="slider-row" for="blur-slider">
+        <span>強さ</span><output id="blur-value">40%</output>
+      </label>
+      <input type="range" id="blur-slider" min="0" max="100" step="1" value="40">
+      <label class="check">
+        <input type="checkbox" id="chk-hide"> 元画像と比較する
+      </label>
+    </div>
+
+    <div class="block">
+      <h2 class="block-title">筆ツール</h2>
+      <div class="segmented" role="group" aria-label="モード">
+        <button type="button" class="seg is-active" id="mode-fg">前景を塗る</button>
+        <button type="button" class="seg" id="mode-bg">背景を塗る</button>
+      </div>
+      <label class="slider-row" for="brush-slider">
+        <span>太さ</span><output id="brush-value">40px</output>
+      </label>
+      <input type="range" id="brush-slider" min="4" max="240" step="1" value="40">
+      <p class="hint" id="mode-hint">ドラッグした場所が前景として残ります (背景がぼかされます)</p>
+      <div class="row">
+        <button type="button" class="btn btn-sm" id="btn-refine"
+                title="塗った領域を基準に背景を検出し直します">筆を反映して再検出</button>
+      </div>
+      <div class="row">
+        <button type="button" class="btn btn-sm" id="btn-undo">筆画を1つ戻す</button>
+        <button type="button" class="btn btn-sm" id="btn-clear-strokes">筆を消す</button>
+      </div>
+    </div>
+
+    <div class="block">
+      <h2 class="block-title">背景の自動検出</h2>
+      <div class="row">
+        <button type="button" class="btn btn-sm" id="btn-segment">背景を再検出</button>
+        <button type="button" class="btn btn-sm" id="btn-clear-mask">マスクを消す</button>
+      </div>
+      <p class="hint" id="segment-hint">写真を追加すると自動で背景を検出します</p>
+    </div>
+
+    <div class="block">
+      <h2 class="block-title">保存</h2>
+      <div class="row">
+        <select id="format" aria-label="保存形式">
+          <option value="image/png">PNG</option>
+          <option value="image/jpeg">JPEG</option>
+        </select>
+        <button type="button" class="btn btn-primary" id="btn-save">ぼかした写真を保存</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel stage">
+    <div class="stage-canvas" id="stage-canvas">
+      <div class="canvas-wrap" id="canvas-wrap">
+        <canvas id="canvas"></canvas>
+        <canvas id="overlay"></canvas>
+        <canvas id="cursor"></canvas>
+      </div>
+      <p class="empty" id="empty-hint">写真をドロップするとここに表示されます</p>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<div class="modal is-hidden" id="modal">
+  <div class="modal-box">
+    <h2 id="modal-title">アップデート</h2>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-primary" id="modal-close">閉じる</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

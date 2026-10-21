@@ -1,0 +1,790 @@
+/* bgblur フロントエンド */
+(() => {
+  'use strict';
+
+  const $ = (id) => document.getElementById(id);
+  const tokenMeta = document.querySelector('meta[name="admin-token"]');
+  const ADMIN_TOKEN = tokenMeta ? tokenMeta.content.trim() : '';
+
+  const MAX_PREVIEW_W = 1280;   // 画面上の表示幅の上限
+  const MAX_PREVIEW_H = 900;    // 画面上の表示高さの上限
+  const SEGMENT_MAX_SIDE = 1600; // セグメンテーションに送る画像の長辺の上限
+  const UNDO_LIMIT = 40;        // 筆画の履歴保持数
+
+  const state = {
+    images: [],      // {id, name, bitmap, width, height, mask, strokes, undo}
+    currentId: null,
+    mode: 'fg',      // fg (前景を塗る) / bg (背景を塗る)
+    blur: 40,        // ぼかしの強さ (%)
+    brush: 40,       // 筆の太さ (元の画像ピクセル)
+    hide: false,     // 元画像と比較する
+    drawing: false,
+    pointerId: null,
+    cursor: null,    // マウスの位置 (元の画像ピクセル)
+    seq: 0,
+  };
+
+  const scratch = {};  // 再利用用の作業用キャンバス
+
+  // ---------- 補助 ----------
+  function withToken(extra) {
+    const headers = Object.assign({}, extra || {});
+    if (ADMIN_TOKEN) headers['X-Bgblur-Token'] = ADMIN_TOKEN;
+    return headers;
+  }
+
+  async function api(path, options = {}) {
+    const opts = Object.assign({}, options);
+    opts.headers = withToken(opts.headers);
+    opts.cache = 'no-store';
+    const res = await fetch(path, opts);
+    const text = await res.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { error: text }; }
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
+  }
+
+  let toastTimer = null;
+  function toast(message, kind) {
+    const el = $('toast');
+    el.textContent = message;
+    el.classList.remove('is-err', 'is-ok');
+    if (kind === 'err') el.classList.add('is-err');
+    if (kind === 'ok') el.classList.add('is-ok');
+    el.classList.add('is-show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('is-show'), 3600);
+  }
+
+  function current() {
+    return state.images.find((img) => img.id === state.currentId) || null;
+  }
+
+  function baseName(name) {
+    return (name || 'image').replace(/\.[^.]+$/, '') || 'image';
+  }
+
+  function base64ToBlob(b64, type) {
+    const bin = atob(b64 || '');
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: type || 'image/png' });
+  }
+
+  async function bitmapFromMask(b64) {
+    if (!b64) return null;
+    try {
+      return await createImageBitmap(base64ToBlob(b64));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ---------- 画像の読み込み ----------
+  async function loadFiles(fileList) {
+    const files = Array.from(fileList || []).filter((f) => /^image\//.test(f.type));
+    if (!files.length) {
+      toast('画像ファイルを選んでください', 'err');
+      return;
+    }
+    for (const file of files) {
+      try {
+        const bitmap = await createImageBitmap(file);
+        const img = {
+          id: ++state.seq,
+          name: file.name || 'image',
+          bitmap: bitmap,
+          width: bitmap.width,
+          height: bitmap.height,
+          mask: null,       // 自動検出のマスク (アルファを持つ PNG)
+          serverId: null,   // サーバーに保存した画像の名前
+          strokes: [],
+          undo: [],
+        };
+        state.images.push(img);
+        await segmentImage(img);
+      } catch (err) {
+        toast(`${file.name || '画像'}: ${err.message}`, 'err');
+      }
+    }
+    if (state.images.length) {
+      selectImage(state.images[state.images.length - 1].id);
+      renderThumbs();
+    }
+  }
+
+  function selectImage(id) {
+    state.currentId = id;
+    const img = current();
+    if (!img) return;
+    const canvas = $('canvas');
+    const overlay = $('overlay');
+    const cursor = $('cursor');
+    const scale = previewScale(img);
+    canvas.width = Math.max(1, Math.round(img.width * scale));
+    canvas.height = Math.max(1, Math.round(img.height * scale));
+    overlay.width = canvas.width;
+    overlay.height = canvas.height;
+    cursor.width = canvas.width;
+    cursor.height = canvas.height;
+    state.cursor = null;
+    $('empty-hint').classList.add('is-hidden');
+    render();
+    renderThumbs();
+    renderSegmentHint();
+  }
+
+  function previewScale(img) {
+    return Math.min(1, MAX_PREVIEW_W / img.width, MAX_PREVIEW_H / img.height);
+  }
+
+  // ---------- 背景セグメンテーション ----------
+  async function segmentImage(img) {
+    const scale = Math.min(1, SEGMENT_MAX_SIDE / Math.max(img.width, img.height));
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext('2d').drawImage(img.bitmap, 0, 0, w, h);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+    if (!blob) throw new Error('画像を変換できませんでした');
+
+    const data = await api('/api/segment', {
+      method: 'POST',
+      body: blob,
+      headers: { 'Content-Type': 'image/jpeg' },
+    });
+
+    img.serverId = data.id || null;
+    img.mask = data.mask || null;
+    img.maskBitmap = await bitmapFromMask(img.mask);
+    img.strokes = [];
+    img.undo = [];
+    return data;
+  }
+
+  async function runSegment(img) {
+    if (!img) {
+      toast('先に写真を選んでください', 'err');
+      return;
+    }
+    const button = $('btn-segment');
+    button.classList.add('is-busy');
+    try {
+      await segmentImage(img);
+      render();
+      renderSegmentHint();
+      toast('背景を再検出しました', 'ok');
+    } catch (err) {
+      toast(`背景の検出に失敗しました: ${err.message}`, 'err');
+    } finally {
+      button.classList.remove('is-busy');
+    }
+  }
+
+  // ---------- 筆を基準にマスクを作り直す ----------
+  function strokeCanvas(img, mode) {
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = '#fff';
+    ctx.fillStyle = '#fff';
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (const stroke of img.strokes) {
+      if (stroke.mode !== mode) continue;
+      const points = stroke.points;
+      if (!points.length) continue;
+      ctx.beginPath();
+      ctx.lineWidth = Math.max(1, stroke.size);
+      ctx.moveTo(points[0].x, points[0].y);
+      if (points.length === 1) {
+        ctx.lineTo(points[0].x + 0.01, points[0].y);
+      } else {
+        for (let i = 1; i < points.length; i += 1) ctx.lineTo(points[i].x, points[i].y);
+      }
+      ctx.stroke();
+    }
+    return canvas;
+  }
+
+  async function runRefine(img) {
+    if (!img) {
+      toast('先に写真を選んでください', 'err');
+      return;
+    }
+    if (!img.strokes.length) {
+      toast('先に筆で前景や背景を塗ってください', 'err');
+      return;
+    }
+    const button = $('btn-refine');
+    button.classList.add('is-busy');
+    try {
+      const payload = { id: img.serverId, mask: img.mask };
+      const fg = strokeCanvas(img, 'fg');
+      const bg = strokeCanvas(img, 'bg');
+      if (hasStroke(img, 'fg')) payload.foreground = fg.toDataURL('image/png');
+      if (hasStroke(img, 'bg')) payload.background = bg.toDataURL('image/png');
+
+      const data = await api('/api/refine', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      img.mask = data.mask || null;
+      img.maskBitmap = await bitmapFromMask(img.mask);
+      render();
+      renderSegmentHint();
+      toast('筆の塗りを反映しました', 'ok');
+    } catch (err) {
+      toast(`再検出に失敗しました: ${err.message}`, 'err');
+    } finally {
+      button.classList.remove('is-busy');
+    }
+  }
+
+  function hasStroke(img, mode) {
+    return img.strokes.some((s) => s.mode === mode && s.points.length);
+  }
+
+  // ---------- 描画 ----------
+  function scratchCanvas(key, w, h) {
+    let canvas = scratch[key];
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      scratch[key] = canvas;
+    }
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    return canvas;
+  }
+
+  function blurRadius(img) {
+    // 強さ (%) を画像の短辺に対するぼかし半径 (px) に変換する.
+    const base = Math.min(img.width, img.height);
+    return Math.max(0.5, (state.blur / 100) * base * 0.06);
+  }
+
+  // 前景マスク (自動検出の結果 + 筆で塗った部分) を w x h のキャンバスにする.
+  function buildMask(img, w, h) {
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    const scale = w / img.width;
+    ctx.clearRect(0, 0, w, h);
+    if (img.maskBitmap) ctx.drawImage(img.maskBitmap, 0, 0, w, h);
+
+    ctx.strokeStyle = '#fff';
+    ctx.fillStyle = '#fff';
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (const stroke of img.strokes) {
+      const points = stroke.points;
+      if (!points.length) continue;
+      ctx.save();
+      // 背景を塗ったところだけは前景から差し引く.
+      ctx.globalCompositeOperation = stroke.mode === 'bg' ? 'destination-out' : 'source-over';
+      ctx.beginPath();
+      ctx.lineWidth = Math.max(1, stroke.size * scale);
+      ctx.moveTo(points[0].x * scale, points[0].y * scale);
+      if (points.length === 1) {
+        ctx.lineTo(points[0].x * scale + 0.01, points[0].y * scale);
+      } else {
+        for (let i = 1; i < points.length; i += 1) {
+          ctx.lineTo(points[i].x * scale, points[i].y * scale);
+        }
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+    return canvas;
+  }
+
+  // ぼかした背景を描く. 端が暗くならないよう, 余白を足してからぼかす.
+  function drawBlurred(ctx, bitmap, w, h, radius, target) {
+    if (radius <= 0.01) {
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      return;
+    }
+    const pad = Math.max(2, Math.ceil(radius * 3));
+    const lw = Math.max(1, Math.round(w + pad * 2));
+    const lh = Math.max(1, Math.round(h + pad * 2));
+    const layer = target || scratchCanvas('blur', lw, lh);
+    if (layer.width !== lw || layer.height !== lh) {
+      layer.width = lw;
+      layer.height = lh;
+    }
+    const lctx = layer.getContext('2d');
+    lctx.clearRect(0, 0, layer.width, layer.height);
+    lctx.filter = `blur(${radius}px)`;
+    lctx.drawImage(bitmap, 0, 0, layer.width, layer.height);
+    lctx.filter = 'none';
+    ctx.drawImage(layer, 0, 0, w, h);
+  }
+
+  function render() {
+    const img = current();
+    const canvas = $('canvas');
+    const overlay = $('overlay');
+    const cursor = $('cursor');
+    if (!img) {
+      canvas.width = 0;
+      canvas.height = 0;
+      overlay.width = 0;
+      overlay.height = 0;
+      cursor.width = 0;
+      cursor.height = 0;
+      return;
+    }
+    const w = canvas.width;
+    const h = canvas.height;
+    const scale = w / img.width;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+
+    if (state.hide) {
+      ctx.drawImage(img.bitmap, 0, 0, w, h);
+    } else {
+      // 背景 = ぼかした画像
+      drawBlurred(ctx, img.bitmap, w, h, blurRadius(img) * scale);
+
+      // 前景 = マスクの所だけ元の画像
+      const mask = buildMask(img, w, h);
+      const fg = scratchCanvas('fg', w, h);
+      const fctx = fg.getContext('2d');
+      fctx.clearRect(0, 0, w, h);
+      fctx.drawImage(img.bitmap, 0, 0, w, h);
+      fctx.globalCompositeOperation = 'destination-in';
+      fctx.drawImage(mask, 0, 0);
+      fctx.globalCompositeOperation = 'source-over';
+      ctx.drawImage(fg, 0, 0);
+    }
+
+    drawOverlay(img, scale);
+  }
+
+  function drawOverlay(img, scale) {
+    const overlay = $('overlay');
+    const ctx = overlay.getContext('2d');
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+  }
+
+  // ---------- 筆のカーソル ----------
+  function drawCursor() {
+    const canvas = $('cursor');
+    const img = current();
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!img || !state.cursor) return;
+
+    const scale = canvas.width / img.width;
+    const x = state.cursor.x * scale;
+    const y = state.cursor.y * scale;
+    const r = Math.max(2, (state.brush / 2) * scale);  // 筆の太さと同じ大きさ
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = state.mode === 'bg' ? 'rgba(255, 120, 120, 0.16)' : 'rgba(120, 220, 255, 0.16)';
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.55)';
+    ctx.stroke();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
+    ctx.stroke();
+  }
+
+  // ---------- 筆ツール ----------
+  function toImageCoords(event) {
+    const canvas = $('canvas');
+    const rect = canvas.getBoundingClientRect();
+    const img = current();
+    if (!img || !rect.width) return { x: 0, y: 0 };
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * img.width,
+      y: ((event.clientY - rect.top) / rect.height) * img.height,
+    };
+  }
+
+  function pushUndo(img) {
+    img.undo.push(JSON.stringify(img.strokes));
+    if (img.undo.length > UNDO_LIMIT) img.undo.shift();
+  }
+
+  function undo(img) {
+    if (!img || !img.undo.length) {
+      toast('戻せる筆画がありません', 'err');
+      return;
+    }
+    img.strokes = JSON.parse(img.undo.pop());
+    render();
+    toast('1 つ前の筆画に戻しました', 'ok');
+  }
+
+  function onPointerDown(event) {
+    const img = current();
+    if (!img) return;
+    const point = toImageCoords(event);
+    state.cursor = point;
+    drawCursor();
+    event.preventDefault();
+    $('canvas').setPointerCapture(event.pointerId);
+    state.drawing = true;
+    state.pointerId = event.pointerId;
+    pushUndo(img);
+    img.strokes.push({ mode: state.mode, size: state.brush, points: [point] });
+    render();
+  }
+
+  function onPointerMove(event) {
+    const img = current();
+    if (!img) return;
+    const point = toImageCoords(event);
+    state.cursor = point;
+    if (!state.drawing || event.pointerId !== state.pointerId) {
+      drawCursor();
+      return;
+    }
+    const stroke = img.strokes[img.strokes.length - 1];
+    if (!stroke) return;
+    const last = stroke.points[stroke.points.length - 1];
+    if (Math.hypot(point.x - last.x, point.y - last.y) < 2) return;
+    stroke.points.push(point);
+    render();
+    drawCursor();  // ドラッグ中も円をカーソルに追従させる
+  }
+
+  function onPointerUp(event) {
+    if (event.pointerId !== state.pointerId) return;
+    state.drawing = false;
+    state.pointerId = null;
+  }
+
+  function onPointerLeave() {
+    if (state.drawing) return;  // ドラッグ中は消さない
+    state.cursor = null;
+    drawCursor();
+  }
+
+  // ---------- サムネイル ----------
+  function renderThumbs() {
+    const box = $('thumbs');
+    box.textContent = '';
+    for (const img of state.images) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'thumb' + (img.id === state.currentId ? ' is-active' : '');
+      button.title = img.name;
+      const thumb = document.createElement('canvas');
+      const size = 52;
+      const scale = Math.min(size / img.width, size / img.height);
+      thumb.width = Math.max(1, Math.round(img.width * scale));
+      thumb.height = Math.max(1, Math.round(img.height * scale));
+      thumb.getContext('2d').drawImage(img.bitmap, 0, 0, thumb.width, thumb.height);
+      button.append(thumb);
+      button.addEventListener('click', () => selectImage(img.id));
+      box.append(button);
+    }
+  }
+
+  function renderSegmentHint() {
+    const hint = $('segment-hint');
+    const img = current();
+    if (!img) {
+      hint.textContent = '写真を追加すると自動で背景を検出します';
+      return;
+    }
+    hint.textContent = img.mask
+      ? '背景を検出しました. 筆で直したいときは「筆を反映して再検出」を押してください'
+      : 'まだ背景を検出していません';
+  }
+
+  // ---------- 保存 ----------
+  function renderFullSize(img) {
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    if (state.hide) {
+      ctx.drawImage(img.bitmap, 0, 0);
+      return canvas;
+    }
+    const layer = document.createElement('canvas');
+    drawBlurred(ctx, img.bitmap, img.width, img.height, blurRadius(img), layer);
+
+    const mask = buildMask(img, img.width, img.height);
+    const fg = document.createElement('canvas');
+    fg.width = img.width;
+    fg.height = img.height;
+    const fctx = fg.getContext('2d');
+    fctx.drawImage(img.bitmap, 0, 0);
+    fctx.globalCompositeOperation = 'destination-in';
+    fctx.drawImage(mask, 0, 0);
+    fctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(fg, 0, 0);
+    return canvas;
+  }
+
+  function save() {
+    const img = current();
+    if (!img) {
+      toast('写真がありません', 'err');
+      return;
+    }
+    const mime = $('format').value;
+    const ext = mime === 'image/png' ? 'png' : 'jpg';
+    const canvas = renderFullSize(img);
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          toast('保存できませんでした', 'err');
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${baseName(img.name)}-blur.${ext}`;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        toast('保存しました', 'ok');
+      },
+      mime,
+      0.92
+    );
+  }
+
+  // ---------- アップデート / 再起動 ----------
+  const modal = $('modal');
+  $('modal-close').addEventListener('click', () => modal.classList.add('is-hidden'));
+
+  function openModal(title, body) {
+    $('modal-title').textContent = title;
+    $('modal-body').textContent = body;
+    modal.classList.remove('is-hidden');
+  }
+
+  async function waitForService(timeoutMs) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      try {
+        const res = await fetch('/api/health', { cache: 'no-store' });
+        if (res.ok) return true;
+      } catch (_) { /* 再起動中 */ }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    return false;
+  }
+
+  $('btn-update').addEventListener('click', async () => {
+    const btn = $('btn-update');
+    btn.classList.add('is-busy');
+    openModal('アップデート', '開始しています...');
+    try {
+      await api('/api/update', { method: 'POST' });
+      let last = '';
+      for (;;) {
+        let status;
+        try {
+          status = await api('/api/update/status');
+        } catch (_) {
+          await new Promise((r) => setTimeout(r, 1200));
+          continue;
+        }
+        const lines = [];
+        (status.steps || []).forEach((s) => {
+          const mark = { running: '…', done: '✓', error: '×' }[s.state] || '·';
+          lines.push(`${mark} ${s.name}${s.output ? ` — ${s.output}` : ''}`);
+        });
+        const text = lines.join('\n') + (status.message ? `\n\n${status.message}` : '');
+        if (text !== last) {
+          $('modal-body').textContent = text;
+          last = text;
+        }
+        if (status.state === 'error') {
+          toast(status.message || 'アップデートに失敗しました', 'err');
+          break;
+        }
+        if (status.state === 'done' || status.state === 'idle') {
+          $('modal-body').textContent += '\n\n再起動しています...';
+          const back = await waitForService(120000);
+          toast(back ? 'アップデートが完了しました' : '再起動に時間がかかっています', back ? 'ok' : '');
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    } catch (err) {
+      toast(err.message, 'err');
+    } finally {
+      btn.classList.remove('is-busy');
+      setTimeout(() => modal.classList.add('is-hidden'), 1500);
+    }
+  });
+
+  $('btn-restart').addEventListener('click', async () => {
+    const btn = $('btn-restart');
+    btn.classList.add('is-busy');
+    try {
+      await api('/api/restart', { method: 'POST' });
+      toast('再起動しています...');
+      const back = await waitForService(30000);
+      if (back) {
+        toast('再起動しました', 'ok');
+        window.location.reload();
+      } else {
+        toast('再起動に時間がかかっています', '');
+      }
+    } catch (err) {
+      toast(err.message, 'err');
+    } finally {
+      btn.classList.remove('is-busy');
+    }
+  });
+
+  // ---------- 操作 ----------
+  const dropzone = $('dropzone');
+  const fileInput = $('file-input');
+
+  dropzone.addEventListener('click', () => fileInput.click());
+  dropzone.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      fileInput.click();
+    }
+  });
+  fileInput.addEventListener('change', () => {
+    loadFiles(fileInput.files);
+    fileInput.value = '';
+  });
+
+  ['dragenter', 'dragover'].forEach((name) => {
+    window.addEventListener(name, (event) => {
+      event.preventDefault();
+      dropzone.classList.add('is-over');
+    });
+  });
+  ['dragleave', 'drop'].forEach((name) => {
+    window.addEventListener(name, (event) => {
+      event.preventDefault();
+      if (name === 'dragleave' && event.relatedTarget) return;
+      dropzone.classList.remove('is-over');
+    });
+  });
+  window.addEventListener('drop', (event) => {
+    event.preventDefault();
+    if (event.dataTransfer && event.dataTransfer.files.length) {
+      loadFiles(event.dataTransfer.files);
+    }
+  });
+
+  const canvas = $('canvas');
+  canvas.classList.add('is-brush');
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', onPointerUp);
+  canvas.addEventListener('pointerleave', onPointerLeave);
+
+  const modes = {
+    'mode-fg': {
+      mode: 'fg',
+      hint: 'ドラッグした場所が前景として残ります (背景がぼかされます)',
+    },
+    'mode-bg': {
+      mode: 'bg',
+      hint: 'ドラッグした場所は背景として扱われます (前景からは外れます)',
+    },
+  };
+  Object.keys(modes).forEach((id) => {
+    $(id).addEventListener('click', () => {
+      Object.keys(modes).forEach((key) => $(key).classList.remove('is-active'));
+      $(id).classList.add('is-active');
+      state.mode = modes[id].mode;
+      $('mode-hint').textContent = modes[id].hint;
+      drawCursor();
+    });
+  });
+
+  const blurSlider = $('blur-slider');
+  blurSlider.addEventListener('input', () => {
+    state.blur = Number(blurSlider.value);
+    $('blur-value').textContent = `${state.blur}%`;
+    render();
+  });
+
+  const brushSlider = $('brush-slider');
+  brushSlider.addEventListener('input', () => {
+    state.brush = Number(brushSlider.value);
+    $('brush-value').textContent = `${state.brush}px`;
+    drawCursor();
+  });
+
+  $('chk-hide').addEventListener('change', (event) => {
+    state.hide = event.target.checked;
+    render();
+  });
+
+  $('btn-segment').addEventListener('click', () => runSegment(current()));
+  $('btn-refine').addEventListener('click', () => runRefine(current()));
+  $('btn-clear-mask').addEventListener('click', () => {
+    const img = current();
+    if (!img) return;
+    img.mask = null;
+    img.maskBitmap = null;
+    img.strokes = [];
+    img.undo = [];
+    render();
+    renderSegmentHint();
+    toast('マスクを消しました');
+  });
+
+  $('btn-undo').addEventListener('click', () => undo(current()));
+  $('btn-clear-strokes').addEventListener('click', () => {
+    const img = current();
+    if (!img || !img.strokes.length) return;
+    pushUndo(img);
+    img.strokes = [];
+    render();
+  });
+
+  $('btn-clear-cache').addEventListener('click', async () => {
+    const btn = $('btn-clear-cache');
+    btn.classList.add('is-busy');
+    try {
+      const data = await api('/api/cache/clear', { method: 'POST' });
+      const removed = data.removed || 0;
+      toast(
+        removed ? `サーバーのキャッシュ画像を ${removed} 件削除しました` : 'キャッシュ画像はありません',
+        'ok'
+      );
+    } catch (err) {
+      toast(`キャッシュの削除に失敗しました: ${err.message}`, 'err');
+    } finally {
+      btn.classList.remove('is-busy');
+    }
+  });
+
+  $('btn-save').addEventListener('click', save);
+
+  // ---------- 起動時 ----------
+  (async () => {
+    try {
+      const info = await api('/api/info');
+      if (info.version_label) $('version').textContent = info.version_label;
+      document.title = `${info.name || 'bgblur'} ${info.version_label || ''}`.trim();
+      if (info.repo) $('btn-update').title = `${info.repo} から最新版に更新します`;
+      if (info.model && !info.model.ready) {
+        toast('背景セグメンテーションのモデルをダウンロードしています (初回だけ少しかかります)');
+      }
+    } catch (_) { /* オフラインでも画面は使える */ }
+  })();
+
+  renderSegmentHint();
+})();
