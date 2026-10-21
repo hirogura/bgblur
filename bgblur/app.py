@@ -103,7 +103,9 @@ def make_handler(app: App):
 
         # --- ヘルパ ---------------------------------------------------------
         def log_message(self, fmt, *args):  # 静かにする
-            if self.path.startswith("/api/"):
+            # リクエストの解析に失敗した handler には self.path が無い.
+            path = getattr(self, "path", "") or ""
+            if path.startswith("/api/"):
                 print(f"{self.address_string()} {fmt % args}", flush=True)
 
         def _send(self, code: int, body: bytes, ctype: str = "application/json"):

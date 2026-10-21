@@ -10,7 +10,7 @@ ExecStart=/opt/bgblur/.venv/bin/python -m bgblur
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
-Environment=BGBLUR_HOST=0.0.0.0
+Environment=BGBLUR_HOST=127.0.0.1
 Environment=BGBLUR_PORT=3371
 # 背景セグメンテーションに使う rembg のモデル (u2net / u2netp / isnet-general-use など).
 # Environment=BGBLUR_MODEL=u2net

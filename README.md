@@ -34,8 +34,10 @@ systemd のサービスとして登録・起動します.
 
 - 待ち受けは `127.0.0.1:3371` (localhost のみ) です.
 - `tailscale serve` がある環境では `https://<端末名>:3371/` でも公開します.
+  (`tailscale serve` は同じポートを tailnet 側のアドレスで listen するため,
+  `BGBLUR_HOST=0.0.0.0` で公開すると `address already in use` になります.)
 - LAN などに公開したい場合は `BGBLUR_HOST=0.0.0.0 sudo ./scripts/install.sh`
-  のように環境変数を指定してください.
+  のように環境変数を指定してください (この場合 `tailscale serve` との併用は不可).
 
 ## 使い方
 
