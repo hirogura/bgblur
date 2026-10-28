@@ -18,6 +18,7 @@
     mode: 'fg',      // fg (前景を塗る) / bg (背景を塗る)
     blur: 40,        // ぼかしの強さ (%)
     depth: true,     // 深度ぼかし (前景から離れるほど強くぼかす)
+    trim: false,     // トリミング (前景だけ残して背景を透過)
     brush: 40,       // 筆の太さ (元の画像ピクセル)
     hide: false,     // 元画像と比較する
     drawing: false,
@@ -434,6 +435,19 @@
     drawBlurred(ctx, img.bitmap, w, h, radius);
   }
 
+  // 前景だけを描く (マスクの外 = 背景は透過のまま).
+  function drawForeground(ctx, img, w, h) {
+    const fg = scratchCanvas('fg', w, h);
+    const fctx = fg.getContext('2d');
+    fctx.globalCompositeOperation = 'source-over';
+    fctx.clearRect(0, 0, w, h);
+    fctx.drawImage(img.bitmap, 0, 0, w, h);
+    fctx.globalCompositeOperation = 'destination-in';
+    fctx.drawImage(buildMask(img, w, h), 0, 0);
+    fctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(fg, 0, 0);
+  }
+
   function render() {
     const img = current();
     const canvas = $('canvas');
@@ -456,20 +470,15 @@
 
     if (state.hide) {
       ctx.drawImage(img.bitmap, 0, 0, w, h);
+    } else if (state.trim) {
+      // トリミング = 前景だけ (背景は透過)
+      drawForeground(ctx, img, w, h);
     } else {
       // 背景 = ぼかした画像 (深度ぼかしなら離れるほど強い)
       drawBackground(ctx, img, w, h, blurRadius(img) * scale);
 
       // 前景 = マスクの所だけ元の画像
-      const mask = buildMask(img, w, h);
-      const fg = scratchCanvas('fg', w, h);
-      const fctx = fg.getContext('2d');
-      fctx.clearRect(0, 0, w, h);
-      fctx.drawImage(img.bitmap, 0, 0, w, h);
-      fctx.globalCompositeOperation = 'destination-in';
-      fctx.drawImage(mask, 0, 0);
-      fctx.globalCompositeOperation = 'source-over';
-      ctx.drawImage(fg, 0, 0);
+      drawForeground(ctx, img, w, h);
     }
 
     drawOverlay(img, scale);
@@ -620,18 +629,13 @@
       ctx.drawImage(img.bitmap, 0, 0);
       return canvas;
     }
+    if (state.trim) {
+      // トリミング = 前景だけ (背景は透過)
+      drawForeground(ctx, img, img.width, img.height);
+      return canvas;
+    }
     drawBackground(ctx, img, img.width, img.height, blurRadius(img));
-
-    const mask = buildMask(img, img.width, img.height);
-    const fg = document.createElement('canvas');
-    fg.width = img.width;
-    fg.height = img.height;
-    const fctx = fg.getContext('2d');
-    fctx.drawImage(img.bitmap, 0, 0);
-    fctx.globalCompositeOperation = 'destination-in';
-    fctx.drawImage(mask, 0, 0);
-    fctx.globalCompositeOperation = 'source-over';
-    ctx.drawImage(fg, 0, 0);
+    drawForeground(ctx, img, img.width, img.height);
     return canvas;
   }
 
@@ -643,6 +647,7 @@
     }
     const mime = $('format').value;
     const ext = mime === 'image/png' ? 'png' : 'jpg';
+    const suffix = state.trim ? 'trim' : 'blur';
     const canvas = renderFullSize(img);
     canvas.toBlob(
       (blob) => {
@@ -653,12 +658,16 @@
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = `${baseName(img.name)}-blur.${ext}`;
+        link.download = `${baseName(img.name)}-${suffix}.${ext}`;
         document.body.append(link);
         link.click();
         link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 10000);
-        toast('保存しました', 'ok');
+        if (state.trim && mime === 'image/jpeg') {
+          toast('JPEG は透過を保持できません (背景は黒になります)');
+        } else {
+          toast('保存しました', 'ok');
+        }
       },
       mime,
       0.92
@@ -837,6 +846,20 @@
 
   $('chk-depth').addEventListener('change', (event) => {
     state.depth = event.target.checked;
+    if (state.depth) {
+      state.trim = false;
+      $('chk-trim').checked = false;
+    }
+    render();
+  });
+
+  // トリミング (前景だけ残す) は深度ぼかしと排他.
+  $('chk-trim').addEventListener('change', (event) => {
+    state.trim = event.target.checked;
+    if (state.trim) {
+      state.depth = false;
+      $('chk-depth').checked = false;
+    }
     render();
   });
 
