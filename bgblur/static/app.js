@@ -10,12 +10,14 @@
   const MAX_PREVIEW_H = 900;    // 画面上の表示高さの上限
   const SEGMENT_MAX_SIDE = 1600; // セグメンテーションに送る画像の長辺の上限
   const UNDO_LIMIT = 40;        // 筆画の履歴保持数
+  const DEPTH_BANDS = 8;        // 深度ぼかしの段階数 (多いほど滑らかで遅い)
 
   const state = {
     images: [],      // {id, name, bitmap, width, height, mask, strokes, undo}
     currentId: null,
     mode: 'fg',      // fg (前景を塗る) / bg (背景を塗る)
     blur: 40,        // ぼかしの強さ (%)
+    depth: true,     // 深度ぼかし (前景から離れるほど強くぼかす)
     brush: 40,       // 筆の太さ (元の画像ピクセル)
     hide: false,     // 元画像と比較する
     drawing: false,
@@ -307,8 +309,30 @@
     return canvas;
   }
 
-  // ぼかした背景を描く. 端が暗くならないよう, 余白を足してからぼかす.
-  function drawBlurred(ctx, bitmap, w, h, radius, target) {
+  // 画像と鏡像を敷き詰める. (ox, oy) がオリジナルの左上. 端でぼかしが
+  // 薄くならないように, 余白にも内容を伸ばす.
+  function blitMirrored(ctx, source, sw, sh, ox, oy) {
+    const put = (dx, dy, fx, fy) => {
+      ctx.save();
+      ctx.translate(dx, dy);
+      ctx.scale(fx, fy);
+      ctx.drawImage(source, 0, 0, sw, sh);
+      ctx.restore();
+    };
+    put(ox, oy, 1, 1);
+    put(ox, oy, -1, 1);
+    put(ox + 2 * sw, oy, -1, 1);
+    put(ox, oy, 1, -1);
+    put(ox, oy + 2 * sh, 1, -1);
+    put(ox, oy, -1, -1);
+    put(ox + 2 * sw, oy, -1, -1);
+    put(ox, oy + 2 * sh, -1, -1);
+    put(ox + 2 * sw, oy + 2 * sh, -1, -1);
+  }
+
+  // ぼかした画像を描く. 鏡像の余白を足してからぼかすので, 端が暗くならず,
+  // 内容も元の位置に戻る (違う半径の層を重ねてもずれない).
+  function drawBlurred(ctx, bitmap, w, h, radius) {
     if (radius <= 0.01) {
       ctx.drawImage(bitmap, 0, 0, w, h);
       return;
@@ -316,17 +340,98 @@
     const pad = Math.max(2, Math.ceil(radius * 3));
     const lw = Math.max(1, Math.round(w + pad * 2));
     const lh = Math.max(1, Math.round(h + pad * 2));
-    const layer = target || scratchCanvas('blur', lw, lh);
-    if (layer.width !== lw || layer.height !== lh) {
-      layer.width = lw;
-      layer.height = lh;
-    }
+    const prep = scratchCanvas('blur-prep', lw, lh);
+    const pctx = prep.getContext('2d');
+    pctx.globalCompositeOperation = 'source-over';
+    pctx.clearRect(0, 0, lw, lh);
+    blitMirrored(pctx, bitmap, w, h, pad, pad);
+
+    const layer = scratchCanvas('blur', lw, lh);
     const lctx = layer.getContext('2d');
-    lctx.clearRect(0, 0, layer.width, layer.height);
+    lctx.globalCompositeOperation = 'source-over';
+    lctx.clearRect(0, 0, lw, lh);
     lctx.filter = `blur(${radius}px)`;
-    lctx.drawImage(bitmap, 0, 0, layer.width, layer.height);
+    lctx.drawImage(prep, 0, 0);
     lctx.filter = 'none';
-    ctx.drawImage(layer, 0, 0, w, h);
+    ctx.drawImage(layer, -pad, -pad);
+  }
+
+  // 前景マスクから「前景からの近さ」の地図 (w x h, 不透明グレースケール) を作る.
+  // マスクをぼかすと境界で 0.5, 内側で 1 になるので 2 倍して 0-1 に伸ばす.
+  // (前景と境界付近で 1, 離れるほど 0 に下がる.)
+  function buildDepthMap(img, w, h, spread) {
+    // ぼかしが画像の外を参照しても減光しないよう, 鏡像でパディングする.
+    const pad = Math.max(2, Math.ceil(spread * 2));
+    const lw = Math.max(1, w + pad * 2);
+    const lh = Math.max(1, h + pad * 2);
+    const gray = scratchCanvas('depth-gray', lw, lh);
+    const gctx = gray.getContext('2d');
+    gctx.globalCompositeOperation = 'source-over';
+    gctx.fillStyle = '#000';
+    gctx.fillRect(0, 0, lw, lh);
+    blitMirrored(gctx, buildMask(img, w, h), w, h, pad, pad);
+
+    const full = scratchCanvas('depth-full', lw, lh);
+    const fctx = full.getContext('2d');
+    fctx.globalCompositeOperation = 'source-over';
+    fctx.clearRect(0, 0, lw, lh);
+    fctx.filter = `blur(${spread}px) brightness(2)`;
+    fctx.drawImage(gray, 0, 0);
+    fctx.filter = 'none';
+
+    const near = scratchCanvas('depth-near', w, h);
+    const nctx = near.getContext('2d');
+    nctx.globalCompositeOperation = 'source-over';
+    nctx.clearRect(0, 0, w, h);
+    nctx.drawImage(full, -pad, -pad);
+    return near;
+  }
+
+  // 近さの地図を「しきい値より近い領域だけ残すマスク」に変えるフィルタ.
+  function nearMaskFilter(threshold, ramp) {
+    const contrast = 1 + (2 * threshold) / ramp;
+    return `brightness(${1 / (ramp * contrast)}) contrast(${contrast})`;
+  }
+
+  // 深度ぼかし: 全力のぼかしを敷き, 前景に近い領域ほど弱いぼかしで上書きする.
+  // 段階ごとのマスクは近さの地図をしきい値で刻んで作る.
+  function drawDepthBlurred(ctx, img, w, h, maxRadius) {
+    const bands = DEPTH_BANDS;
+    // 前景の境界からこの距離でぼかしが最大強度になる (短辺比)
+    const spread = Math.max(8, Math.min(w, h) * 0.15);
+    const near = buildDepthMap(img, w, h, spread);
+
+    drawBlurred(ctx, img.bitmap, w, h, maxRadius);
+
+    const layer = scratchCanvas('depth-layer', w, h);
+    const mask = scratchCanvas('depth-mask', w, h);
+    for (let k = bands - 1; k >= 1; k -= 1) {
+      const lctx = layer.getContext('2d');
+      lctx.globalCompositeOperation = 'source-over';
+      lctx.clearRect(0, 0, w, h);
+      drawBlurred(lctx, img.bitmap, w, h, (maxRadius * (k - 0.5)) / bands);
+
+      const mctx = mask.getContext('2d');
+      mctx.globalCompositeOperation = 'source-over';
+      mctx.clearRect(0, 0, w, h);
+      mctx.filter = nearMaskFilter((bands - k) / bands, 1 / bands);
+      mctx.drawImage(near, 0, 0);
+      mctx.filter = 'none';
+
+      lctx.globalCompositeOperation = 'destination-in';
+      lctx.drawImage(mask, 0, 0);
+      lctx.globalCompositeOperation = 'source-over';
+      ctx.drawImage(layer, 0, 0);
+    }
+  }
+
+  // 背景の描画. 深度ぼかしが ON なら前景から離れるほど強くぼかす.
+  function drawBackground(ctx, img, w, h, radius) {
+    if (state.depth && radius >= 1) {
+      drawDepthBlurred(ctx, img, w, h, radius);
+      return;
+    }
+    drawBlurred(ctx, img.bitmap, w, h, radius);
   }
 
   function render() {
@@ -352,8 +457,8 @@
     if (state.hide) {
       ctx.drawImage(img.bitmap, 0, 0, w, h);
     } else {
-      // 背景 = ぼかした画像
-      drawBlurred(ctx, img.bitmap, w, h, blurRadius(img) * scale);
+      // 背景 = ぼかした画像 (深度ぼかしなら離れるほど強い)
+      drawBackground(ctx, img, w, h, blurRadius(img) * scale);
 
       // 前景 = マスクの所だけ元の画像
       const mask = buildMask(img, w, h);
@@ -515,8 +620,7 @@
       ctx.drawImage(img.bitmap, 0, 0);
       return canvas;
     }
-    const layer = document.createElement('canvas');
-    drawBlurred(ctx, img.bitmap, img.width, img.height, blurRadius(img), layer);
+    drawBackground(ctx, img, img.width, img.height, blurRadius(img));
 
     const mask = buildMask(img, img.width, img.height);
     const fg = document.createElement('canvas');
@@ -728,6 +832,11 @@
 
   $('chk-hide').addEventListener('change', (event) => {
     state.hide = event.target.checked;
+    render();
+  });
+
+  $('chk-depth').addEventListener('change', (event) => {
+    state.depth = event.target.checked;
     render();
   });
 

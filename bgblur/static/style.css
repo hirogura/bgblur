@@ -204,6 +204,16 @@ input[type="range"] {
   color: var(--text-dim);
 }
 
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 4px 14px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.check-row .check { margin-top: 0; }
+
 .segmented {
   display: flex;
   border: 1px solid var(--border);
