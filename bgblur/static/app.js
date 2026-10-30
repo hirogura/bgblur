@@ -396,10 +396,15 @@
 
   // 深度ぼかし: 全力のぼかしを敷き, 前景に近い領域ほど弱いぼかしで上書きする.
   // 段階ごとのマスクは近さの地図をしきい値で刻んで作る.
-  function drawDepthBlurred(ctx, img, w, h, maxRadius) {
+  function drawDepthBlurred(ctx, img, w, h, radius) {
     const bands = DEPTH_BANDS;
+    // ぼかし (%) を上げるほど最大半径も, 前景から最大ぼけに達するまでの
+    // 距離も伸ばす. 100% なら等方的なぼかしの 2 倍まで強まり, 遠景ほど
+    // 大きな差がつく.
+    const p = state.blur / 100;
+    const maxRadius = radius * (1 + p);
     // 前景の境界からこの距離でぼかしが最大強度になる (短辺比)
-    const spread = Math.max(8, Math.min(w, h) * 0.15);
+    const spread = Math.max(8, Math.min(w, h) * (0.12 + 0.18 * p));
     const near = buildDepthMap(img, w, h, spread);
 
     drawBlurred(ctx, img.bitmap, w, h, maxRadius);
