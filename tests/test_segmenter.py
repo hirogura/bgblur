@@ -105,6 +105,38 @@ def test_refine_needs_an_image(tmp_path):
         segmenter.refine("これは画像ではありません".encode())
 
 
+def test_refine_reflects_the_threshold(tmp_path):
+    import cv2
+    import numpy as np
+
+    segmenter = Segmenter(tmp_path)
+    # 自動検出のマスク: 前景っぽい (200), ちょうど境界 (110), 背景 (0) の 3 段階
+    prior = np.zeros((16, 24), dtype=np.uint8)
+    prior[0:5, :] = 200
+    prior[5:10, :] = 110
+
+    def refined_mask(threshold):
+        ok, buf = cv2.imencode(".png", prior)
+        assert ok
+        result = segmenter.refine(
+            make_png(),
+            mask=base64.b64encode(buf.tobytes()).decode("ascii"),
+            threshold=threshold,
+        )
+        return decode_base64_mask(result["mask"])
+
+    # 既定 (しきい値なし) は従来どおり 128 以上が前景.
+    default_mask = refined_mask(None)
+    assert default_mask[4, 24] == 255
+    assert default_mask[14, 24] == 0
+    # しきい値を下げると境界付近の値も前景に変わる.
+    lowered = refined_mask(20)
+    assert lowered[14, 24] == 255
+    # しきい値を上げると前景の一部が背景に戻る.
+    raised = refined_mask(95)
+    assert raised[4, 24] == 0
+
+
 def test_encode_mask_png_keeps_the_mask_in_alpha():
     import cv2
     import numpy as np

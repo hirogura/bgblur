@@ -73,7 +73,7 @@ def test_index_has_version(server):
     status, body = get(f"{server}/")
     assert status == 200
     assert VERSION_LABEL in body
-    assert "v.0.3.1" in body
+    assert "v.0.4.0" in body
 
 
 def test_index_has_update_and_restart_buttons(server):
@@ -93,6 +93,8 @@ def test_index_has_editor_controls(server):
     assert "brush-slider" in body
     assert "btn-refine" in body
     assert "btn-segment" in body
+    assert "edge-slider" in body
+    assert "輪郭のしきい値" in body
     assert "chk-depth" in body
     assert "chk-trim" in body
     assert "深度ぼかし" in body

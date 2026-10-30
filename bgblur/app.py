@@ -221,6 +221,7 @@ def make_handler(app: App):
                         mask=payload.get("mask"),
                         foreground=payload.get("foreground"),
                         background=payload.get("background"),
+                        threshold=payload.get("threshold"),
                     )
                     self._json(200, result)
                 elif path == "/api/cache/clear":

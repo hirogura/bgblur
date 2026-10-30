@@ -11,6 +11,7 @@
   const SEGMENT_MAX_SIDE = 1600; // セグメンテーションに送る画像の長辺の上限
   const UNDO_LIMIT = 40;        // 筆画の履歴保持数
   const DEPTH_BANDS = 8;        // 深度ぼかしの段階数 (多いほど滑らかで遅い)
+  const EDGE_RAMP = 0.12;       // 輪郭のしきい値付近のなじませ幅
 
   const state = {
     images: [],      // {id, name, bitmap, width, height, mask, strokes, undo}
@@ -18,6 +19,7 @@
     mode: 'fg',      // fg (前景を塗る) / bg (背景を塗る)
     blur: 40,        // ぼかしの強さ (%)
     depth: true,     // 深度ぼかし (前景から離れるほど強くぼかす)
+    threshold: 50,   // 輪郭のしきい値 (%) 前景マスクを前景とみなす境界
     trim: false,     // トリミング (前景だけ残して背景を透過)
     brush: 40,       // 筆の太さ (元の画像ピクセル)
     hide: false,     // 元画像と比較する
@@ -82,6 +84,27 @@
     } catch (_) {
       return null;
     }
+  }
+
+  // 自動検出のソフトなマスクに輪郭のしきい値を適用したマスクを作る.
+  // しきい値より濃い部分は前景 (不透明), 薄い部分は背景 (透過) になる.
+  function applyMaskThreshold(source, pct) {
+    if (!source) return null;
+    const canvas = document.createElement('canvas');
+    canvas.width = source.width;
+    canvas.height = source.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(source, 0, 0);
+    const lo = (pct / 100) - EDGE_RAMP / 2;
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const px = data.data;
+    for (let i = 3; i < px.length; i += 4) {
+      const a = px[i] / 255;
+      const v = Math.max(0, Math.min(1, (a - lo) / EDGE_RAMP));
+      px[i] = Math.round(v * 255);
+    }
+    ctx.putImageData(data, 0, 0);
+    return canvas;
   }
 
   // ---------- 画像の読み込み ----------
@@ -162,7 +185,8 @@
 
     img.serverId = data.id || null;
     img.mask = data.mask || null;
-    img.maskBitmap = await bitmapFromMask(img.mask);
+    img.maskSoftBitmap = await bitmapFromMask(img.mask);
+    img.maskBitmap = applyMaskThreshold(img.maskSoftBitmap, state.threshold);
     img.strokes = [];
     img.undo = [];
     return data;
@@ -227,7 +251,7 @@
     const button = $('btn-refine');
     button.classList.add('is-busy');
     try {
-      const payload = { id: img.serverId, mask: img.mask };
+      const payload = { id: img.serverId, mask: img.mask, threshold: state.threshold };
       const fg = strokeCanvas(img, 'fg');
       const bg = strokeCanvas(img, 'bg');
       if (hasStroke(img, 'fg')) payload.foreground = fg.toDataURL('image/png');
@@ -239,7 +263,8 @@
         body: JSON.stringify(payload),
       });
       img.mask = data.mask || null;
-      img.maskBitmap = await bitmapFromMask(img.mask);
+      img.maskSoftBitmap = await bitmapFromMask(img.mask);
+      img.maskBitmap = applyMaskThreshold(img.maskSoftBitmap, state.threshold);
       render();
       renderSegmentHint();
       toast('筆の塗りを反映しました', 'ok');
@@ -868,6 +893,19 @@
     render();
   });
 
+  // 輪郭のしきい値. 保存しておいたソフトなマスクを即座に塗り直す.
+  const edgeSlider = $('edge-slider');
+  edgeSlider.addEventListener('input', () => {
+    state.threshold = Number(edgeSlider.value);
+    $('edge-value').textContent = `${state.threshold}%`;
+    for (const img of state.images) {
+      if (img.maskSoftBitmap) {
+        img.maskBitmap = applyMaskThreshold(img.maskSoftBitmap, state.threshold);
+      }
+    }
+    render();
+  });
+
   $('btn-segment').addEventListener('click', () => runSegment(current()));
   $('btn-refine').addEventListener('click', () => runRefine(current()));
   $('btn-clear-mask').addEventListener('click', () => {
@@ -875,6 +913,7 @@
     if (!img) return;
     img.mask = null;
     img.maskBitmap = null;
+    img.maskSoftBitmap = null;
     img.strokes = [];
     img.undo = [];
     render();

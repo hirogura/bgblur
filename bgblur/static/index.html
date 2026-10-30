@@ -83,6 +83,10 @@
 
     <div class="block">
       <h2 class="block-title">背景の自動検出</h2>
+      <label class="slider-row" for="edge-slider">
+        <span>輪郭のしきい値</span><output id="edge-value">50%</output>
+      </label>
+      <input type="range" id="edge-slider" min="1" max="99" step="1" value="50">
       <div class="row">
         <button type="button" class="btn btn-sm" id="btn-segment">背景を再検出</button>
         <button type="button" class="btn btn-sm" id="btn-clear-mask">マスクを消す</button>

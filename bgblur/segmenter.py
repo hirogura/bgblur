@@ -260,11 +260,14 @@ class Segmenter:
         mask: str | None = None,
         foreground: str | None = None,
         background: str | None = None,
+        threshold: float | None = None,
     ) -> dict:
         """筆で塗った領域を前景/背景の確定情報としてマスクを作り直す.
 
         ``mask`` は自動検出の結果 (省略可), ``foreground`` / ``background``
-        は利用者が塗った領域. どちらも base64 の PNG.
+        は利用者が塗った領域. どちらも base64 の PNG. ``threshold`` は
+        自動検出のマスクを「たぶん前景」とみなす輪郭のしきい値 (0-100%,
+        省略時は既定の 50% 相当).
         """
         import cv2
         import numpy as np
@@ -276,12 +279,18 @@ class Segmenter:
         if min(sh, sw) < GRABCUT_MIN_SIDE:
             raise ValueError("画像が小さすぎます")
 
+        if threshold is None:
+            cut = 128
+        else:
+            cut = int(round(255.0 * max(0.0, min(100.0, float(threshold))) / 100.0))
+            cut = max(1, min(255, cut))
+
         gc_mask = np.full((sh, sw), cv2.GC_PR_BGD, dtype=np.uint8)
 
         prior = decode_base64_mask(mask)
         if prior is not None:
             prior = cv2.resize(prior, (sw, sh), interpolation=cv2.INTER_LINEAR)
-            gc_mask[prior > 127] = cv2.GC_PR_FGD
+            gc_mask[prior >= cut] = cv2.GC_PR_FGD
 
         fg = decode_base64_mask(foreground)
         if fg is not None:
