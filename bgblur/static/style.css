@@ -430,3 +430,7 @@ input[type="range"] {
 }
 
 .modal-actions { margin-top: 12px; text-align: right; }
+
+/* selfphoto 連携 (embed=selfphoto) 用の保存ボタン */
+.sp-actions { flex-wrap: wrap; }
+.sp-actions .btn { flex: 1 1 auto; }

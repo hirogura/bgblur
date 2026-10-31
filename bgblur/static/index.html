@@ -103,6 +103,12 @@
         </select>
         <button type="button" class="btn btn-primary" id="btn-save">ぼかした写真を保存</button>
       </div>
+      <div class="row sp-actions" id="sp-save-row" hidden>
+        <button type="button" class="btn btn-primary" id="sp-overwrite" title="selfphoto の元ファイルに上書きします">上書き保存</button>
+        <button type="button" class="btn" id="sp-saveas" title="selfphoto で別名 (_edit) で保存します">別名保存</button>
+        <button type="button" class="btn" id="sp-tolibrary" title="selfphoto の編集フォルダ (edit-photo) に保存します">編集フォルダに保存</button>
+      </div>
+      <p class="hint" id="sp-hint" hidden>selfphoto の編集画面から呼び出しています。下のボタンで結果を selfphoto に保存します</p>
     </div>
   </section>
 

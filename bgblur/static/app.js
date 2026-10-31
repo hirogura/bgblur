@@ -6,6 +6,14 @@
   const tokenMeta = document.querySelector('meta[name="admin-token"]');
   const ADMIN_TOKEN = tokenMeta ? tokenMeta.content.trim() : '';
 
+  // selfphoto 連携 (embed=selfphoto) 導入.
+  // selfphoto の /blur/bgblur/ プロキシ経由で iframe に組み込まれたときに
+  // 有効になり, API はプロキシ基点 (/blur/bgblur/api/...) を使う.
+  const SP_EMBED =
+    new URLSearchParams(location.search).get('embed') === 'selfphoto';
+  const SP_BASE = (location.pathname.match(/^\/blur\/[a-z]+/) || [''])[0];
+  const P = (path) => (SP_BASE ? `${SP_BASE}${path}` : path);
+
   const MAX_PREVIEW_W = 1280;   // 画面上の表示幅の上限
   const MAX_PREVIEW_H = 900;    // 画面上の表示高さの上限
   const SEGMENT_MAX_SIDE = 1600; // セグメンテーションに送る画像の長辺の上限
@@ -42,7 +50,7 @@
     const opts = Object.assign({}, options);
     opts.headers = withToken(opts.headers);
     opts.cache = 'no-store';
-    const res = await fetch(path, opts);
+    const res = await fetch(P(path), opts);
     const text = await res.text();
     let data = {};
     try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { error: text }; }
@@ -718,7 +726,7 @@
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
       try {
-        const res = await fetch('/api/health', { cache: 'no-store' });
+        const res = await fetch(P('/api/health'), { cache: 'no-store' });
         if (res.ok) return true;
       } catch (_) { /* 再起動中 */ }
       await new Promise((r) => setTimeout(r, 800));
@@ -949,6 +957,53 @@
 
   $('btn-save').addEventListener('click', save);
 
+  // ---------- selfphoto 連携 ----------
+  async function loadFromSelfphoto(data) {
+    try {
+      const file = new File([data.blob], data.name || 'photo',
+                            { type: data.mime || 'image/png' });
+      await loadFiles([file]);
+      toast('selfphoto から写真を受け取りました', 'ok');
+    } catch (err) {
+      toast(`selfphoto との連携に失敗しました: ${err.message}`, 'err');
+    }
+  }
+
+  // 結果を selfphoto の保存 API に渡す (iframe の親に postMessage).
+  function saveToSelfphoto(mode) {
+    const img = current();
+    if (!img) {
+      toast('写真がありません', 'err');
+      return;
+    }
+    const mime = $('format').value;
+    const ext = mime === 'image/png' ? 'png' : 'jpg';
+    const suffix = state.trim ? 'trim' : 'blur';
+    const canvas = renderFullSize(img);
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          toast('保存できませんでした', 'err');
+          return;
+        }
+        window.parent.postMessage({
+          type: 'selfphoto-save',
+          mode: mode,
+          blob: blob,
+          mime: mime,
+          name: `${baseName(img.name)}-${suffix}.${ext}`,
+        }, '*');
+        if (state.trim && mime === 'image/jpeg') {
+          toast('JPEG は透過を保持できません (背景は黒になります)');
+        } else {
+          toast('selfphoto に保存しています...', 'ok');
+        }
+      },
+      mime,
+      0.92
+    );
+  }
+
   // ---------- 起動時 ----------
   (async () => {
     try {
@@ -961,6 +1016,27 @@
       }
     } catch (_) { /* オフラインでも画面は使える */ }
   })();
+
+  if (SP_EMBED) {
+    // 「ぼかした写真を保存」の下に selfphoto 用の保存ボタンを置く
+    const row = $('sp-save-row');
+    if (row) row.hidden = false;
+    const hint = $('sp-hint');
+    if (hint) hint.hidden = false;
+    // iframe 内でのアップデート/再起動は selfphoto 連携の改正を失わせるため隠す
+    const upd = $('btn-update');
+    const rst = $('btn-restart');
+    if (upd) upd.hidden = true;
+    if (rst) rst.hidden = true;
+    $('sp-overwrite').addEventListener('click', () => saveToSelfphoto('overwrite'));
+    $('sp-saveas').addEventListener('click', () => saveToSelfphoto('saveas'));
+    $('sp-tolibrary').addEventListener('click', () => saveToSelfphoto('library'));
+    window.addEventListener('message', (ev) => {
+      const data = ev.data || {};
+      if (data.type === 'selfphoto-load' && data.blob) loadFromSelfphoto(data);
+    });
+    window.parent.postMessage({ type: 'selfphoto-ready' }, '*');
+  }
 
   renderSegmentHint();
 })();
