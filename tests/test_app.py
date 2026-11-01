@@ -73,7 +73,7 @@ def test_index_has_version(server):
     status, body = get(f"{server}/")
     assert status == 200
     assert VERSION_LABEL in body
-    assert "v.0.4.2" in body
+    assert "v.0.4.3" in body
 
 
 def test_index_has_update_and_restart_buttons(server):

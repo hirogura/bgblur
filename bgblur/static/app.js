@@ -40,12 +40,40 @@
   const scratch = {};  // 再利用用の作業用キャンバス
 
   // ctx.filter (blur などの CSSフィルタ) が使えるかどうか.
-  // Safari では (insider 版を含めても) 使えない (none と返る). 使える環境は
-  // ネイティブのガウスぼかしを, それ以外は縮小→拡大の繰り返しで近似する.
+  // Safari では使えないので, その場合は縮小→拡大の繰り返しで近似する.
+  // 単に代入して読み返すだけだと, 定義がないブラウザでも普通のプロパティ
+  // (expando) が作られて同じ値が返って「使える」と誤判定するため,
+  // プロトタイプに定義がある事と, 実際に描画してぼけが生まれる事を確認する.
   const CANVAS_FILTER = (() => {
-    const probe = document.createElement('canvas').getContext('2d');
-    probe.filter = 'blur(1px)';
-    return probe.filter === 'blur(1px)';
+    try {
+      const probe = document.createElement('canvas').getContext('2d');
+      if (!probe || !('filter' in probe)) return false;
+      probe.filter = 'blur(1px)';
+      if (probe.filter !== 'blur(1px)') return false;
+      // フラグが入っていない WebKit ビルドのように, 値は持つが描画に
+      // 反映しない環境があるので, 実際に描画して確認する.
+      const src = document.createElement('canvas');
+      src.width = 8;
+      src.height = 8;
+      const sctx = src.getContext('2d');
+      sctx.fillStyle = '#000';
+      sctx.fillRect(0, 0, 4, 8);
+      const dst = document.createElement('canvas');
+      dst.width = 8;
+      dst.height = 8;
+      const dctx = dst.getContext('2d');
+      dctx.fillStyle = '#fff';
+      dctx.fillRect(0, 0, 8, 8);
+      dctx.filter = 'blur(2px)';
+      dctx.drawImage(src, 0, 0);
+      dctx.filter = 'none';
+      const d = dctx.getImageData(0, 0, 8, 8).data;
+      // 黒白の境界が完全黒でも完全白でもなければぼけている.
+      const g = (x) => d[(4 * 8 + x) * 4];
+      return g(1) > 0 && g(3) < 255 && g(2) > 0 && g(2) < 255;
+    } catch (_) {
+      return false;
+    }
   })();
 
   // ---------- 補助 ----------
@@ -340,11 +368,88 @@
     cctx.putImageData(data, 0, 0);
   }
 
-  // ガウスぼかし (radius = 標準偏差 σ) で src を dst (同サイズ) に描く.
-  // ctx.filter が使える環境はネイティブで, 使えない環境 (Safari) では
-  // 「scale 倍に縮めて戻す」を繰り返し近似する (1 往復で幅 scale の
-  // 三角フィルタ ≈ 分散 scale²/3 のぼかしになるので,
-  // 3*(radius/scale)² 往復で σ ≈ radius になる).
+  // sigma に見合う 3 つの箱の幅を返す (Kovesi の方法).
+  function boxesForGauss(sigma, n) {
+    const wIdeal = Math.sqrt((12 * sigma * sigma) / n + 1);
+    let wl = Math.floor(wIdeal);
+    if (wl % 2 === 0) wl -= 1;
+    const wu = wl + 2;
+    const mIdeal = (12 * sigma * sigma - n * wl * wl - 4 * n * wl - 3 * n) / (-4 * wl - 4);
+    const m = Math.round(mIdeal);
+    const sizes = [];
+    for (let i = 0; i < n; i += 1) sizes.push(i < m ? wl : wu);
+    return sizes;
+  }
+
+  // premultiplied RGBA のバッファに箱ぼかし 1 往復 (水平 → 垂直) を掛ける.
+  function blurBoxPass(cur, tmp, sw, sh, boxW, horizontal) {
+    const r = Math.floor(boxW / 2);
+    if (r < 1) return;
+    const len = horizontal ? sw : sh;
+    const lines = horizontal ? sh : sw;
+    const pstep = horizontal ? 4 : sw * 4;   // 隣のピクセルへのバイト差
+    const lstep = horizontal ? sw * 4 : 4;   // 次の行の先頭へのバイト差
+    const span = r * 2 + 1;
+    for (let a = 0; a < lines; a += 1) {
+      const base = a * lstep;
+      let s0 = 0;
+      let s1 = 0;
+      let s2 = 0;
+      let s3 = 0;
+      for (let i = -r; i <= r; i += 1) {
+        const o = base + Math.max(0, Math.min(len - 1, i)) * pstep;
+        s0 += cur[o];
+        s1 += cur[o + 1];
+        s2 += cur[o + 2];
+        s3 += cur[o + 3];
+      }
+      for (let i = 0; i < len; i += 1) {
+        const o = base + i * pstep;
+        tmp[o] = s0 / span;
+        tmp[o + 1] = s1 / span;
+        tmp[o + 2] = s2 / span;
+        tmp[o + 3] = s3 / span;
+        const outO = base + Math.max(0, Math.min(len - 1, i - r)) * pstep;
+        const inO = base + Math.max(0, Math.min(len - 1, i + r + 1)) * pstep;
+        s0 += cur[inO] - cur[outO];
+        s1 += cur[inO + 1] - cur[outO + 1];
+        s2 += cur[inO + 2] - cur[outO + 2];
+        s3 += cur[inO + 3] - cur[outO + 3];
+      }
+    }
+  }
+
+  // ImageData のピクセルを box ぼかし 3 周でガウスぼかし (sigma) 近似する.
+  // (Safari 等の ctx.filter 非対応環境用. 半透明にも正しく効くよう
+  // premultiplied に直してからぼかす.)
+  function boxBlurImage(data, sw, sh, sigma) {
+    const boxes = boxesForGauss(sigma, 3);
+    const cur = new Float32Array(data.length);
+    const tmp = new Float32Array(data.length);
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3] / 255;
+      cur[i] = data[i] * a;
+      cur[i + 1] = data[i + 1] * a;
+      cur[i + 2] = data[i + 2] * a;
+      cur[i + 3] = data[i + 3];
+    }
+    for (const bw of boxes) {
+      blurBoxPass(cur, tmp, sw, sh, bw, true);
+      blurBoxPass(tmp, cur, sw, sh, bw, false);
+    }
+    for (let i = 0; i < data.length; i += 4) {
+      const f = cur[i + 3] > 0.1 ? 255 / cur[i + 3] : 0;
+      data[i] = Math.min(255, Math.round(cur[i] * f));
+      data[i + 1] = Math.min(255, Math.round(cur[i + 1] * f));
+      data[i + 2] = Math.min(255, Math.round(cur[i + 2] * f));
+      data[i + 3] = Math.min(255, Math.round(cur[i + 3]));
+    }
+  }
+
+  // ガウスぼかし (radius = 標準偏差 σ) で src を dst に描く.
+  // ctx.filter が使える環境 (Chrome / Firefox) はネイティブで描く.
+  // 使えない環境 (Safari) では JS のほどかし (低解像度で箱ぼかし 3 周で
+  // ガウス近似して元の解像度へ引き戻す).
   function drawBlurredInto(dst, src, radius) {
     if (CANVAS_FILTER) {
       dst.filter = `blur(${radius}px)`;
@@ -354,20 +459,22 @@
     }
     const w = src.width;
     const h = src.height;
-    // 縮小しすぎて粗がでないよう, scale は最小辺の 1/4 までに制限する.
-    const scale = Math.max(1, Math.min(radius, Math.min(w, h) / 4));
-    const passes = Math.max(1, Math.round(3 * ((radius / scale) ** 2)));
-    const smallW = Math.max(1, Math.round(w / scale));
-    const smallH = Math.max(1, Math.round(h / scale));
-    let current = src;
-    for (let i = 0; i < passes; i += 1) {
-      const small = scratchCanvas('blur-small', smallW, smallH);
-      drawResampledInto(small, current, smallW, smallH);
-      const grow = scratchCanvas('blur-grow', w, h);
-      drawResampledInto(grow, small, w, h);
-      current = grow;
+    // 低解像度化の倍率. ぼかしから来る粗はぼかしで消えるので,
+    // 小さな点数で下げておくと高速 (σ を 2 前後に保つのが狙い).
+    const d = Math.max(2, Math.min(radius / 2, Math.min(w, h) / 8));
+    const smallW = Math.max(1, Math.round(w / d));
+    const smallH = Math.max(1, Math.round(h / d));
+    const small = scratchCanvas('blur-small', smallW, smallH);
+    drawResampledInto(small, src, smallW, smallH);
+    if (radius / d >= 0.5) {
+      const sctx = small.getContext('2d');
+      const data = sctx.getImageData(0, 0, smallW, smallH);
+      boxBlurImage(data.data, smallW, smallH, radius / d);
+      sctx.putImageData(data, 0, 0);
     }
-    dst.drawImage(current, 0, 0);
+    dst.imageSmoothingEnabled = true;
+    dst.imageSmoothingQuality = 'high';
+    dst.drawImage(small, 0, 0, w, h);
   }
 
   // 前景マスク (自動検出の結果 + 筆で塗った部分) を w x h のキャンバスにする.
