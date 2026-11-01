@@ -1,6 +1,6 @@
 """bgblur: 商品写真の背景を自動でぼかす小さな Web アプリ."""
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 APP_NAME = "bgblur"
 VERSION_LABEL = f"v.{__version__}"

@@ -39,6 +39,15 @@
 
   const scratch = {};  // 再利用用の作業用キャンバス
 
+  // ctx.filter (blur などの CSSフィルタ) が使えるかどうか.
+  // Safari では (insider 版を含めても) 使えない (none と返る). 使える環境は
+  // ネイティブのガウスぼかしを, それ以外は縮小→拡大の繰り返しで近似する.
+  const CANVAS_FILTER = (() => {
+    const probe = document.createElement('canvas').getContext('2d');
+    probe.filter = 'blur(1px)';
+    return probe.filter === 'blur(1px)';
+  })();
+
   // ---------- 補助 ----------
   function withToken(extra) {
     const headers = Object.assign({}, extra || {});
@@ -307,6 +316,60 @@
     return Math.max(0.5, (state.blur / 100) * base * 0.06);
   }
 
+  // srcCanvas を dst に平滑化つきで (dst の寸法に) 縮小/拡大して描く.
+  function drawResampledInto(dst, src, w, h) {
+    const dctx = dst.getContext('2d');
+    dctx.globalCompositeOperation = 'source-over';
+    dctx.imageSmoothingEnabled = true;
+    dctx.imageSmoothingQuality = 'high';
+    dctx.clearRect(0, 0, w, h);
+    dctx.drawImage(src, 0, 0, w, h);
+  }
+
+  // brightness 操作 (RGB を係数倍して飽和) を ctx.filter 未対応の代用として
+  // getImageData/putImageData で行う.
+  function applyBrightness(canvas, factor) {
+    const cctx = canvas.getContext('2d');
+    const data = cctx.getImageData(0, 0, canvas.width, canvas.height);
+    const px = data.data;
+    for (let i = 0; i < px.length; i += 4) {
+      px[i] = Math.min(255, px[i] * factor);
+      px[i + 1] = Math.min(255, px[i + 1] * factor);
+      px[i + 2] = Math.min(255, px[i + 2] * factor);
+    }
+    cctx.putImageData(data, 0, 0);
+  }
+
+  // ガウスぼかし (radius = 標準偏差 σ) で src を dst (同サイズ) に描く.
+  // ctx.filter が使える環境はネイティブで, 使えない環境 (Safari) では
+  // 「scale 倍に縮めて戻す」を繰り返し近似する (1 往復で幅 scale の
+  // 三角フィルタ ≈ 分散 scale²/3 のぼかしになるので,
+  // 3*(radius/scale)² 往復で σ ≈ radius になる).
+  function drawBlurredInto(dst, src, radius) {
+    if (CANVAS_FILTER) {
+      dst.filter = `blur(${radius}px)`;
+      dst.drawImage(src, 0, 0);
+      dst.filter = 'none';
+      return;
+    }
+    const w = src.width;
+    const h = src.height;
+    // 縮小しすぎて粗がでないよう, scale は最小辺の 1/4 までに制限する.
+    const scale = Math.max(1, Math.min(radius, Math.min(w, h) / 4));
+    const passes = Math.max(1, Math.round(3 * ((radius / scale) ** 2)));
+    const smallW = Math.max(1, Math.round(w / scale));
+    const smallH = Math.max(1, Math.round(h / scale));
+    let current = src;
+    for (let i = 0; i < passes; i += 1) {
+      const small = scratchCanvas('blur-small', smallW, smallH);
+      drawResampledInto(small, current, smallW, smallH);
+      const grow = scratchCanvas('blur-grow', w, h);
+      drawResampledInto(grow, small, w, h);
+      current = grow;
+    }
+    dst.drawImage(current, 0, 0);
+  }
+
   // 前景マスク (自動検出の結果 + 筆で塗った部分) を w x h のキャンバスにする.
   function buildMask(img, w, h) {
     const canvas = document.createElement('canvas');
@@ -384,9 +447,7 @@
     const lctx = layer.getContext('2d');
     lctx.globalCompositeOperation = 'source-over';
     lctx.clearRect(0, 0, lw, lh);
-    lctx.filter = `blur(${radius}px)`;
-    lctx.drawImage(prep, 0, 0);
-    lctx.filter = 'none';
+    drawBlurredInto(lctx, prep, radius);
     ctx.drawImage(layer, -pad, -pad);
   }
 
@@ -409,9 +470,9 @@
     const fctx = full.getContext('2d');
     fctx.globalCompositeOperation = 'source-over';
     fctx.clearRect(0, 0, lw, lh);
-    fctx.filter = `blur(${spread}px) brightness(2)`;
-    fctx.drawImage(gray, 0, 0);
-    fctx.filter = 'none';
+    drawBlurredInto(fctx, gray, spread);
+    // マスクをぼかすと境界で 0.5 になるので 2 倍して 0-1 に伸ばす.
+    applyBrightness(full, 2);
 
     const near = scratchCanvas('depth-near', w, h);
     const nctx = near.getContext('2d');
@@ -421,14 +482,10 @@
     return near;
   }
 
-  // 近さの地図を「しきい値より近い領域だけ残すマスク」に変えるフィルタ.
-  function nearMaskFilter(threshold, ramp) {
-    const contrast = 1 + (2 * threshold) / ramp;
-    return `brightness(${1 / (ramp * contrast)}) contrast(${contrast})`;
-  }
-
   // 深度ぼかし: 全力のぼかしを敷き, 前景に近い領域ほど弱いぼかしで上書きする.
-  // 段階ごとのマスクは近さの地図をしきい値で刻んで作る.
+  // 段階ごとのマスクは近さの地図 (RGB のグレースケール) をしきい値で刻んで
+  // マスクのアルファにする. (ctx.filter を使わないので, Safari でも
+  // Chrome でも同じ結果になる.)
   function drawDepthBlurred(ctx, img, w, h, radius) {
     const bands = DEPTH_BANDS;
     // ぼかし (%) を上げるほど最大半径も, 前景から最大ぼけに達するまでの
@@ -442,20 +499,27 @@
 
     drawBlurred(ctx, img.bitmap, w, h, maxRadius);
 
+    // 近さの値は一度だけ読み込んで使い回す.
+    const nearData = near.getContext('2d').getImageData(0, 0, w, h).data;
     const layer = scratchCanvas('depth-layer', w, h);
+    const lctx = layer.getContext('2d');
     const mask = scratchCanvas('depth-mask', w, h);
+    const mctx = mask.getContext('2d');
+    const maskData = mctx.createImageData(w, h);
     for (let k = bands - 1; k >= 1; k -= 1) {
-      const lctx = layer.getContext('2d');
       lctx.globalCompositeOperation = 'source-over';
       lctx.clearRect(0, 0, w, h);
       drawBlurred(lctx, img.bitmap, w, h, (maxRadius * (k - 0.5)) / bands);
 
-      const mctx = mask.getContext('2d');
-      mctx.globalCompositeOperation = 'source-over';
-      mctx.clearRect(0, 0, w, h);
-      mctx.filter = nearMaskFilter((bands - k) / bands, 1 / bands);
-      mctx.drawImage(near, 0, 0);
-      mctx.filter = 'none';
+      // しきい値 t より前景に遠い領域ほどマスクを薄く (境界は 1 バンド幅で
+      // なじませる).
+      const t = (bands - k) / bands;
+      const md = maskData.data;
+      for (let i = 0; i < w * h; i += 1) {
+        const a = (nearData[i * 4 + 1] / 255 - t) * bands;
+        md[i * 4 + 3] = Math.max(0, Math.min(255, Math.round(a * 255)));
+      }
+      mctx.putImageData(maskData, 0, 0);
 
       lctx.globalCompositeOperation = 'destination-in';
       lctx.drawImage(mask, 0, 0);
